@@ -433,6 +433,7 @@ void conn_init(struct connection *conn, void *target)
 	conn->dst = NULL;
 	conn->proxy_authority = IST_NULL;
 	conn->proxy_unique_id = IST_NULL;
+	conn->proxy_aws_vpce_id = IST_NULL;
 	conn->hash_node = NULL;
 	conn->xprt = NULL;
 }
@@ -497,6 +498,9 @@ void conn_free(struct connection *conn)
 
 	pool_free(pool_head_uniqueid, istptr(conn->proxy_unique_id));
 	conn->proxy_unique_id = IST_NULL;
+
+	pool_free(pool_head_uniqueid, istptr(conn->proxy_aws_vpce_id));
+	conn->proxy_aws_vpce_id = IST_NULL;
 
 	/* Make sure the connection is not left in the idle connection tree */
 	if (conn->hash_node != NULL)
@@ -1022,13 +1026,16 @@ int conn_recv_proxy(struct connection *conn, int flag)
 		while (tlv_offset < total_v2_len) {
 			struct tlv *tlv_packet;
 			struct ist tlv;
+			size_t tlv_len;
+			struct tlv* new_proxy_tlv;
 
 			/* Verify that we have at least TLV_HEADER_SIZE bytes left */
 			if (tlv_offset + TLV_HEADER_SIZE > total_v2_len)
 				goto bad_header;
 
 			tlv_packet = (struct tlv *) &trash.area[tlv_offset];
-			tlv = ist2((const char *)tlv_packet->value, get_tlv_length(tlv_packet));
+			tlv_len = get_tlv_length(tlv_packet);
+			tlv = ist2((const char *)tlv_packet->value, tlv_len);
 			tlv_offset += istlen(tlv) + TLV_HEADER_SIZE;
 
 			/* Verify that the TLV length does not exceed the total PROXYv2 length */
@@ -1086,6 +1093,34 @@ int conn_recv_proxy(struct connection *conn, int flag)
 				}
 				break;
 			}
+			case PP2_TYPE_MIN_CUSTOM ... PP2_TYPE_MAX_CUSTOM: 
+					if (istlen(tlv) > PP2_TLV_MAX || istlen(tlv) == 0)
+						goto bad_header;
+
+					qfprintf(stdout, "### Received Custom TLV: type=0x%x, len=%lu \n", tlv_packet->type, tlv_len);
+
+					// XXX: fix me later
+					conn->proxy_tlv = malloc(sizeof(struct tlv));
+					new_proxy_tlv = (struct tlv*)conn->proxy_tlv;
+
+					// copy the header
+					memcpy(new_proxy_tlv, tlv_packet, sizeof(struct tlv));
+
+					// copy value
+					conn->proxy_tlv_value = ist2(pool_alloc(pool_head_uniqueid), 0);
+					if (!isttest(conn->proxy_tlv_value)) {
+						memset(new_proxy_tlv, 0, sizeof(struct tlv));
+						goto fail;
+					}
+
+					if (istcpy(&conn->proxy_tlv_value, istadv(tlv, 0), tlv_len) < 0) {
+						// This is impossible, because we verified that the TLV value fits.
+						my_unreachable();
+						goto fail;
+					}
+
+					qfprintf(stdout, "### Copyed Custom TLV: type=0x%x, len=%lu \n", 
+							 new_proxy_tlv->type, get_tlv_length((const struct tlv*)new_proxy_tlv));
 			default:
 				break;
 			}
@@ -1941,6 +1976,46 @@ static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct
 		}
 	}
 
+	if (strm && (srv->pp_opts & SRV_PP_V2_SET_TLV)) {
+		//struct session* sess = strm_sess(strm);
+		char tlv_type = 0xea;
+		char value[20];
+
+
+		qfprintf(stdout, "### Set PPV2 TLV: 0x%x:%d -> 0x%x:%d \n",
+		((struct sockaddr_in *)src)->sin_addr.s_addr,
+		((struct sockaddr_in *)src)->sin_port,
+		((struct sockaddr_in *)dst)->sin_addr.s_addr,
+		((struct sockaddr_in *)dst)->sin_port);
+
+		value[0] = PP2_SUBTYPE_AWS_VPCE_ID;
+		value[1] = 0x1;
+		value[2] = 0x2;
+		value[3] = 0x3;
+		value[4] = 0x4;
+		value[5] = 0x5;
+		value[6] = 0x6;
+		value[7] = 0x7;
+		value[8] = 0x8;
+
+		value_len = 9;
+
+		if (value_len >= 0) {
+			if ((buf_len - ret) < sizeof(struct tlv))
+				return 0;
+
+			ret += make_tlv(&buf[ret], (buf_len - ret), tlv_type, value_len, value);
+		}
+	}
+
+	if (strm && (srv->pp_opts & SRV_PP_V2_FWD_TLV)) {
+		struct tlv* proxy_tlv = (struct tlv*)remote->proxy_tlv;
+
+		// copy TLVs from remote
+		qfprintf(stdout, "### Received Custom TLV: type=0x%x, len=%lu \n", 
+				 proxy_tlv->type, get_tlv_length((const struct tlv*)proxy_tlv));
+	}
+
 #ifdef USE_OPENSSL
 	if (srv->pp_opts & SRV_PP_V2_SSL) {
 		struct tlv_ssl *tlv;
@@ -2207,6 +2282,31 @@ int smp_fetch_fc_pp_unique_id(const struct arg *args, struct sample *smp, const 
 	return 1;
 }
 
+/* fetch the TLV from a PROXY protocol header */
+int smp_fetch_fc_pp_tlv(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct connection *conn;
+
+	conn = objt_conn(smp->sess->origin);
+	if (!conn)
+		return 0;
+
+	if (conn->flags & CO_FL_WAIT_XPRT) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	if (!isttest(conn->proxy_unique_id))
+		return 0;
+
+	smp->flags = 0;
+	smp->data.type = SMP_T_STR;
+	smp->data.u.str.area = istptr(conn->proxy_unique_id);
+	smp->data.u.str.data = istlen(conn->proxy_unique_id);
+
+	return 1;
+}
+
 /* fetch the error code of a connection */
 int smp_fetch_fc_err(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
@@ -2281,6 +2381,9 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "fc_rcvd_proxy", smp_fetch_fc_rcvd_proxy, 0, NULL, SMP_T_BOOL, SMP_USE_L4CLI },
 	{ "fc_pp_authority", smp_fetch_fc_pp_authority, 0, NULL, SMP_T_STR, SMP_USE_L4CLI },
 	{ "fc_pp_unique_id", smp_fetch_fc_pp_unique_id, 0, NULL, SMP_T_STR, SMP_USE_L4CLI },
+	{ "fc_pp_tlv", smp_fetch_fc_pp_tlv, 0, NULL, SMP_T_BIN, SMP_USE_L5CLI },
+	//{ "capture.res.hdr",    smp_fetch_capture_res_hdr,    ARG1(1,SINT),     NULL,   SMP_T_STR,  SMP_USE_HRSHP },
+	//{ "req.body_param",     smp_fetch_body_param,         ARG2(0,STR,STR),  NULL,    SMP_T_BIN,  SMP_USE_HRQHV },
 	{ /* END */ },
 }};
 
