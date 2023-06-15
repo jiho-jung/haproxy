@@ -538,10 +538,9 @@ struct connection {
 	struct sockaddr_storage *dst; /* destination address (pool), when known, otherwise NULL */
 	struct ist proxy_authority;   /* Value of the authority TLV received via PROXYv2 */
 	struct ist proxy_unique_id;   /* Value of the unique ID TLV received via PROXYv2 */
-	struct ist proxy_aws_vpce_id; /* Value of the TLV received via PROXYv2 */
 
-	void* proxy_tlv;
-	struct ist proxy_tlv_value;
+	struct list tlv_nodes;
+	//struct ist proxy_aws_vpce_id; /* Value of the TLV received via PROXYv2 */
 
 	/* used to identify a backend connection for http-reuse,
 	 * thus only present if conn.target is of type OBJ_TYPE_SERVER
@@ -672,6 +671,11 @@ struct tlv {
 	uint8_t length_lo;
 	uint8_t value[0]; // WT: don't use VAR_ARRAY here, it's an end of struct marker
 }__attribute__((packed));
+
+struct tlv_node {
+	struct list list;
+	struct tlv tlv;
+};
 
 struct tlv_ssl {
 	struct tlv tlv;
